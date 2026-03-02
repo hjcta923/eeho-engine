@@ -27,9 +27,9 @@ HEADERS = {
 # ============================================================
 OC = os.environ.get("LAW_API_OC", "")
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
-BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "eeho-tax-knowledge-base-01")
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-001")
+BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")
 
 def parse_redirect(text: str) -> str | None:
     o_match = re.search(r"o:'([^']+)'", text)

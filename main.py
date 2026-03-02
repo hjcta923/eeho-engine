@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()  # .env 파일에서 환경변수 로드 (로컬 개발용, Cloud Run에서는 무시됨)
+
 from fastapi import FastAPI
 import httpx
 import re
@@ -18,9 +22,14 @@ HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
 }
 
-OC = "eeho-public-raw-api"
-PROJECT_ID = "project-9fb5ee59-ec65-4d2a-aa6"
-BUCKET_NAME = "eeho-tax-knowledge-base-01"
+# ============================================================
+# 설정 (환경변수에서 로드)
+# ============================================================
+OC = os.environ.get("LAW_API_OC", "")
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "eeho-tax-knowledge-base-01")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-001")
 
 def parse_redirect(text: str) -> str | None:
     o_match = re.search(r"o:'([^']+)'", text)
@@ -138,8 +147,8 @@ async def test_pipeline():
     # === STEP 3: Gemini 구조화 ===
     ai_text = ""
     try:
-        vertexai.init(project=PROJECT_ID, location="us-central1")
-        model = GenerativeModel("gemini-2.0-flash-001")
+        vertexai.init(project=PROJECT_ID, location=GCP_LOCATION)
+        model = GenerativeModel(GEMINI_MODEL)
         prompt = f"""당신은 대한민국 세법 전문가입니다. 아래 판례를 5가지 항목으로 구조화하세요.
 반드시 JSON만 응답하세요. 다른 텍스트 없이 JSON만 출력하세요.
 

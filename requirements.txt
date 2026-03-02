@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+httpx
+google-cloud-storage
+google-cloud-aiplatform

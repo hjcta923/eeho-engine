@@ -661,3 +661,26 @@ async def debug_search():
         f"?OC={OC}&target=prec&type=JSON&display=1&query=양도소득세"
     )
     return {"raw": data}
+
+@app.get("/debug-detail/{prec_id}")
+async def debug_detail(prec_id: str):
+    results = {}
+    # JSON으로 시도
+    try:
+        data_json = await call_law_api(
+            f"http://www.law.go.kr/DRF/lawService.do"
+            f"?OC={OC}&target=prec&ID={prec_id}&type=JSON"
+        )
+        results["json"] = data_json
+    except Exception as e:
+        results["json_error"] = str(e)
+    # XML로 시도
+    try:
+        data_xml = await call_law_api(
+            f"http://www.law.go.kr/DRF/lawService.do"
+            f"?OC={OC}&target=prec&ID={prec_id}&type=XML"
+        )
+        results["xml"] = data_xml
+    except Exception as e:
+        results["xml_error"] = str(e)
+    return results

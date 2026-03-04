@@ -36,9 +36,16 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "")
 
-# Pinecone 초기화
-pc = Pinecone(api_key=PINECONE_API_KEY)
-pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+# Pinecone 초기화 (지연 로딩 - 서버 시작 시 외부 연결 실패 방지)
+pc = None
+pinecone_index = None
+
+def get_pinecone_index():
+    global pc, pinecone_index
+    if pinecone_index is None:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+    return pinecone_index
 
 
 # ============================================================
@@ -351,7 +358,8 @@ async def upsert_to_pinecone(
 
     # ── Pinecone Integrated Inference 임베딩으로 업서트 ──
     try:
-        pinecone_index.upsert_records(
+        idx = get_pinecone_index()
+        idx.upsert_records(
             namespace="tax_cases",
             records=[
                 {

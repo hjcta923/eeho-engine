@@ -334,7 +334,7 @@ async def upsert_to_pinecone(
             records=[
                 {
                     "id": f"prec_{prec_id}",
-                    "_text": embed_text,
+                    "text": embed_text,
                     **metadata,
                 }
             ],

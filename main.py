@@ -687,26 +687,44 @@ async def debug_detail(prec_id: str):
 
 @app.get("/debug-detail-link")
 async def debug_detail_link():
-    list_data = await call_law_api(
-        f"http://www.law.go.kr/DRF/lawSearch.do"
-        f"?OC={OC}&target=prec&type=JSON&display=1&query=양도소득세"
-    )
-    prec_container = list_data.get("PrecSearch", list_data)
-    prec_list = prec_container.get("prec", [])
-    if isinstance(prec_list, dict):
-        prec_list = [prec_list]
-    first = prec_list[0]
-    prec_id = first.get("판례일련번호", "")
-    results = {"prec_id": prec_id, "search_item": first}
-    # target 종류별로 시도
-    for target in ["prec", "expc", "flawJdgm", "detc"]:
+    # 대법원 판례로 검색 (상세조회 호환성 높음)
+    queries = ["대법원 양도소득세", "양도 비과세 대법원", "양도소득세 판결"]
+    all_results = []
+    for q in queries:
         try:
-            data = await call_law_api(
-                f"http://www.law.go.kr/DRF/lawService.do"
-                f"?OC={OC}&target={target}&ID={prec_id}&type=JSON"
+            list_data = await call_law_api(
+                f"http://www.law.go.kr/DRF/lawSearch.do"
+                f"?OC={OC}&target=prec&type=JSON&display=3&query={q}"
             )
-            results[f"target_{target}"] = data
+            prec_container = list_data.get("PrecSearch", list_data)
+            prec_list = prec_container.get("prec", [])
+            if isinstance(prec_list, dict):
+                prec_list = [prec_list]
+            for item in prec_list:
+                prec_id = item.get("판례일련번호", "")
+                # 상세 조회 시도
+                try:
+                    detail = await call_law_api(
+                        f"http://www.law.go.kr/DRF/lawService.do"
+                        f"?OC={OC}&target=prec&ID={prec_id}&type=JSON"
+                    )
+                    body = json.dumps(detail, ensure_ascii=False)
+                    success = "일치하는" not in body
+                except Exception as e:
+                    detail = str(e)[:100]
+                    success = False
+                all_results.append({
+                    "query": q,
+                    "id": prec_id,
+                    "사건명": item.get("사건명", "")[:60],
+                    "데이터출처명": item.get("데이터출처명", ""),
+                    "사건종류코드": item.get("사건종류코드", ""),
+                    "detail_success": success,
+                    "detail_length": len(json.dumps(detail, ensure_ascii=False)) if success else 0,
+                })
         except Exception as e:
-            results[f"target_{target}_error"] = str(e)[:200]
-    return results
+            all_results.append({"query": q, "error": str(e)[:200]})
+    return {"results": all_results}
+
+
 

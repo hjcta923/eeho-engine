@@ -686,3 +686,12 @@ async def batch_pipeline(query: str = "양도", count: int = 5):
         "processed": len(results),
         "results": results,
     }
+
+
+    @app.get("/debug-search")
+        async def debug_search():
+            data = await call_law_api(
+                f"http://www.law.go.kr/DRF/lawSearch.do"
+                f"?OC={OC}&target=prec&type=JSON&display=1&query=양도소득세"
+            )
+    return {"raw": data}

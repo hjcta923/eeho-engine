@@ -687,7 +687,6 @@ async def debug_detail(prec_id: str):
 
 @app.get("/debug-detail-link")
 async def debug_detail_link():
-    # 먼저 검색해서 상세링크를 가져옴
     list_data = await call_law_api(
         f"http://www.law.go.kr/DRF/lawSearch.do"
         f"?OC={OC}&target=prec&type=JSON&display=1&query=양도소득세"
@@ -697,14 +696,17 @@ async def debug_detail_link():
     if isinstance(prec_list, dict):
         prec_list = [prec_list]
     first = prec_list[0]
-    detail_link = first.get("판례상세링크", "")
     prec_id = first.get("판례일련번호", "")
-    # 상세링크에서 type=HTML을 type=JSON으로 변경
-    json_link = detail_link.replace("type=HTML", "type=JSON")
-    full_url = f"http://www.law.go.kr{json_link}"
-    try:
-        data = await call_law_api(full_url)
-        return {"prec_id": prec_id, "link_used": full_url, "data": data}
-    except Exception as e:
-        return {"prec_id": prec_id, "link_used": full_url, "error": str(e)}
+    results = {"prec_id": prec_id, "search_item": first}
+    # target 종류별로 시도
+    for target in ["prec", "expc", "flawJdgm", "detc"]:
+        try:
+            data = await call_law_api(
+                f"http://www.law.go.kr/DRF/lawService.do"
+                f"?OC={OC}&target={target}&ID={prec_id}&type=JSON"
+            )
+            results[f"target_{target}"] = data
+        except Exception as e:
+            results[f"target_{target}_error"] = str(e)[:200]
+    return results
 

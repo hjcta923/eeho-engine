@@ -726,5 +726,52 @@ async def debug_detail_link():
             all_results.append({"query": q, "error": str(e)[:200]})
     return {"results": all_results}
 
+@app.get("/test-full/{prec_id}")
+async def test_full(prec_id: str):
+    try:
+        detail_data = await call_law_api(
+            f"http://www.law.go.kr/DRF/lawService.do"
+            f"?OC={OC}&target=prec&ID={prec_id}&type=JSON"
+        )
+        body_text = json.dumps(detail_data, ensure_ascii=False, indent=2)
+        if len(body_text) < 100:
+            return {"error": "본문 너무 짧음", "length": len(body_text)}
+        vertexai.init(project=PROJECT_ID, location=GCP_LOCATION)
+        model = GenerativeModel(GEMINI_MODEL)
+        parse_result = await parse_with_gemini(body_text, model, max_retries=1)
+        if parse_result["status"] != "validated":
+            return {"error": "파싱 실패", "detail": parse_result}
+        structured = parse_result["data"]
+        prec_info = detail_data.get("PrecService", {})
+        case_name = prec_info.get("사건명", "")
+        case_no = prec_info.get("사건번호", "")
+        gcs = storage.Client()
+        bucket = gcs.bucket(BUCKET_NAME)
+        blob = bucket.blob(f"예판/판례/{prec_id}.json")
+        save_data = {
+            "meta": {
+                "판례일련번호": prec_id, "사건명": case_name,
+                "사건번호": case_no,
+                "수집일시": datetime.utcnow().isoformat(),
+                "소스": "국가법령정보_판례", "파싱버전": "v1.1",
+                "종합신뢰도": structured["종합신뢰도"],
+            },
+            "원본": detail_data,
+            "구조화": structured,
+        }
+        blob.upload_from_string(
+            json.dumps(save_data, ensure_ascii=False, indent=2),
+            content_type="application/json"
+        )
+        upsert_result = await upsert_to_pinecone(prec_id, case_name, case_no, structured)
+        return {
+            "status": "success",
+            "종합신뢰도": structured["종합신뢰도"],
+            "GCS": f"gs://{BUCKET_NAME}/예판/판례/{prec_id}.json",
+            "Pinecone": upsert_result,
+            "구조화": structured,
+        }
+    except Exception as e:
+        return {"error": str(e), "trace": tb.format_exc()[-500:]}
 
 

@@ -6,3 +6,4 @@ google-cloud-aiplatform
 python-dotenv
 pinecone
 pydantic
+aiosmtplib

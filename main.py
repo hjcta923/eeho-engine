@@ -959,6 +959,11 @@ async def collect_daily(
                             if case_result.get("status") == "success":
                                 total_new += 1
                                 mark_collected(manifest, target, record_id)
+                                # ★ 건마다 즉시 매니페스트 저장
+                                try:
+                                    save_manifest(manifest)
+                                except Exception:
+                                    pass
 
                             category_results.append(case_result)
 
@@ -1102,6 +1107,12 @@ async def backfill(
                     if case_result.get("status") == "success":
                         total_new += 1
                         mark_collected(manifest, target, record_id)
+                        # ★ 핵심 수정: 건마다 즉시 매니페스트 저장
+                        # → 타임아웃되어도 수집 완료된 건은 기록됨
+                        try:
+                            save_manifest(manifest)
+                        except Exception:
+                            pass
 
                     results.append(case_result)
 
@@ -1111,7 +1122,7 @@ async def backfill(
                     "error": str(e)[:300],
                 })
 
-    # 매니페스트 저장
+    # 최종 매니페스트 저장 (안전장치)
     try:
         save_manifest(manifest)
     except Exception as e:
@@ -1153,6 +1164,58 @@ async def collection_status():
         "총_수집건수": len(prec_ids) + len(expc_ids),
         "최근_수집_판례_5건": dict(list(prec_ids.items())[-5:]) if prec_ids else {},
         "최근_수집_해석례_5건": dict(list(expc_ids.items())[-5:]) if expc_ids else {},
+    }
+
+
+# ============================================================
+# [긴급 수정] 매니페스트 ↔ GCS 동기화 (/sync-manifest)
+# ─────────────────────────────────────────
+# GCS 버킷의 예판/ 폴더를 스캔하여, 실제 저장된 파일의 ID를
+# 매니페스트에 반영합니다. 타임아웃으로 매니페스트가 누락된 경우
+# 이 엔드포인트를 1회 실행하면 복구됩니다.
+# ============================================================
+
+@app.post("/sync-manifest")
+async def sync_manifest():
+    """
+    GCS 버킷을 스캔하여 매니페스트를 실제 저장 상태와 동기화합니다.
+    타임아웃으로 매니페스트가 누락된 경우 복구용입니다.
+    """
+    manifest = load_manifest()
+    added = {"prec": 0, "expc": 0}
+
+    gcs = storage.Client()
+    bucket = gcs.bucket(BUCKET_NAME)
+
+    # 판례 폴더 스캔
+    for blob in bucket.list_blobs(prefix="예판/판례/"):
+        filename = blob.name.split("/")[-1]
+        if not filename.endswith(".json") or "삭제됨" in filename:
+            continue
+        record_id = filename.replace(".json", "")
+        if record_id and not is_already_collected(manifest, "prec", record_id):
+            mark_collected(manifest, "prec", record_id)
+            added["prec"] += 1
+
+    # 법령해석례 폴더 스캔
+    for blob in bucket.list_blobs(prefix="예판/법령해석례/"):
+        filename = blob.name.split("/")[-1]
+        if not filename.endswith(".json") or "삭제됨" in filename:
+            continue
+        record_id = filename.replace(".json", "")
+        if record_id and not is_already_collected(manifest, "expc", record_id):
+            mark_collected(manifest, "expc", record_id)
+            added["expc"] += 1
+
+    save_manifest(manifest)
+
+    return {
+        "status": "synced",
+        "새로_추가된_판례": added["prec"],
+        "새로_추가된_해석례": added["expc"],
+        "동기화_후_총_판례": len(manifest.get("prec", {})),
+        "동기화_후_총_해석례": len(manifest.get("expc", {})),
+        "동기화_후_총_수집건수": len(manifest.get("prec", {})) + len(manifest.get("expc", {})),
     }
 
 

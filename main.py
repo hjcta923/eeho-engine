@@ -1146,6 +1146,166 @@ async def backfill(
 
 
 # ============================================================
+# [신규] 전체 세목 자동 백필 (/backfill-all)
+# ─────────────────────────────────────────
+# Cloud Scheduler가 35분 간격으로 호출합니다.
+# 모든 세목을 자동 순회하며 Cloud Run 타임아웃(30분) 내에서
+# 최대한 많은 판례를 수집합니다.
+#
+# 동작 방식:
+# 1. 8개 세목을 순서대로 순회
+# 2. 각 세목의 쿼리별로 페이지를 넘기며 수집
+# 3. 이미 수집된 건은 자동 스킵
+# 4. 25분 경과 시 안전하게 중단 (5분 여유)
+# 5. 다음 호출 시 이어서 수집 (매니페스트 기반)
+#
+# 예상 처리량: 1회 호출당 약 400~500건
+# 35분 간격 × 하루 40회 ≈ 하루 약 16,000~20,000건
+# ============================================================
+
+@app.post("/backfill-all")
+async def backfill_all():
+    """
+    전체 세목을 자동 순회하며 백필하는 엔드포인트.
+    Cloud Scheduler가 35분 간격으로 호출합니다.
+    25분 경과 시 안전하게 중단합니다.
+    """
+    start_time = datetime.now(KST)
+    TIME_LIMIT_SECONDS = 25 * 60  # 25분 (Cloud Run 30분 타임아웃에 5분 여유)
+
+    manifest = load_manifest()
+
+    vertexai.init(project=PROJECT_ID, location=GCP_LOCATION)
+    model = GenerativeModel(GEMINI_MODEL)
+
+    total_new = 0
+    total_skipped = 0
+    total_errors = 0
+    category_summary = {}
+    time_expired = False
+
+    for category, config in COLLECTION_QUERIES.items():
+        if time_expired:
+            break
+
+        cat_new = 0
+        cat_skipped = 0
+
+        for target in config["targets"]:
+            if time_expired:
+                break
+
+            # expc(법령해석례)는 API 권한이 아직 없으므로 스킵
+            if target == "expc":
+                continue
+
+            for query in config["queries"]:
+                if time_expired:
+                    break
+
+                for page in range(1, BACKFILL_MAX_PAGES_PER_QUERY + 1):
+                    # ── 시간 체크: 25분 초과 시 안전 중단 ──
+                    elapsed = (datetime.now(KST) - start_time).total_seconds()
+                    if elapsed >= TIME_LIMIT_SECONDS:
+                        time_expired = True
+                        break
+
+                    try:
+                        await asyncio.sleep(API_CALL_DELAY)
+                        items, total_count = await search_cases(
+                            target=target,
+                            query=query,
+                            display=BACKFILL_DISPLAY_PER_PAGE,
+                            page=page,
+                        )
+
+                        if not items:
+                            break  # 이 쿼리는 더 이상 결과 없음 → 다음 쿼리로
+
+                        all_skipped_this_page = True
+
+                        for item in items:
+                            # 시간 체크
+                            elapsed = (datetime.now(KST) - start_time).total_seconds()
+                            if elapsed >= TIME_LIMIT_SECONDS:
+                                time_expired = True
+                                break
+
+                            record_id = extract_record_id(item, target)
+                            if not record_id:
+                                continue
+
+                            if is_already_collected(manifest, target, record_id):
+                                cat_skipped += 1
+                                total_skipped += 1
+                                continue
+
+                            all_skipped_this_page = False
+
+                            info = extract_case_info(item, target)
+                            await asyncio.sleep(API_CALL_DELAY)
+
+                            try:
+                                case_result = await process_single_case(
+                                    record_id=info["record_id"],
+                                    case_name=info["case_name"],
+                                    case_no=info["case_no"],
+                                    target=target,
+                                    tax_category=category,
+                                    model=model,
+                                )
+
+                                if case_result.get("status") == "success":
+                                    cat_new += 1
+                                    total_new += 1
+                                    mark_collected(manifest, target, record_id)
+                                    # 건마다 즉시 매니페스트 저장
+                                    try:
+                                        save_manifest(manifest)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                total_errors += 1
+
+                        # 이 페이지가 전부 스킵(이미 수집)이면 다음 페이지도 같을 가능성 높음
+                        # → 다음 쿼리로 넘어감
+                        if all_skipped_this_page and cat_skipped > 50:
+                            break
+
+                    except Exception:
+                        total_errors += 1
+                        break  # 이 쿼리 에러 → 다음 쿼리로
+
+        category_summary[category] = {
+            "new": cat_new,
+            "skipped": cat_skipped,
+        }
+
+    # 최종 매니페스트 저장
+    try:
+        save_manifest(manifest)
+    except Exception:
+        pass
+
+    end_time = datetime.now(KST)
+    elapsed = (end_time - start_time).total_seconds()
+
+    return {
+        "job": "backfill-all",
+        "elapsed_seconds": round(elapsed, 1),
+        "time_expired": time_expired,
+        "summary": {
+            "total_new_saved": total_new,
+            "total_skipped": total_skipped,
+            "total_errors": total_errors,
+            "manifest_prec_count": len(manifest.get("prec", {})),
+            "manifest_expc_count": len(manifest.get("expc", {})),
+        },
+        "category_summary": category_summary,
+    }
+
+
+# ============================================================
 # 수집 현황 조회 (/collection-status)
 # ============================================================
 

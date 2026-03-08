@@ -1152,28 +1152,70 @@ async def backfill(
 # 모든 세목을 자동 순회하며 Cloud Run 타임아웃(30분) 내에서
 # 최대한 많은 판례를 수집합니다.
 #
-# 동작 방식:
-# 1. 8개 세목을 순서대로 순회
-# 2. 각 세목의 쿼리별로 페이지를 넘기며 수집
-# 3. 이미 수집된 건은 자동 스킵
-# 4. 25분 경과 시 안전하게 중단 (5분 여유)
-# 5. 다음 호출 시 이어서 수집 (매니페스트 기반)
+# [핵심: 페이지 커서 시스템]
+# 각 세목/쿼리별로 "어디까지 검색했는지" 페이지 번호를 GCS에 저장합니다.
+# 다음 호출 시 해당 페이지부터 시작하므로, 이미 훑은 페이지를
+# 다시 훑지 않습니다. 이로써 스킵에 소비되는 시간을 제거합니다.
 #
-# 예상 처리량: 1회 호출당 약 400~500건
+# 커서 구조 (GCS 수집관리/backfill_cursor.json):
+# {
+#   "양도소득세__prec__양도소득세": {"page": 9, "done": false},
+#   "양도소득세__prec__1세대1주택 비과세": {"page": 1, "done": true},
+#   ...
+# }
+#
+# "done": true → 해당 쿼리는 마지막 페이지까지 수집 완료 → 스킵
+#
+# 예상 처리량: 1회 호출당 약 400~500건 (스킵 오버헤드 제거)
 # 35분 간격 × 하루 40회 ≈ 하루 약 16,000~20,000건
 # ============================================================
+
+BACKFILL_CURSOR_PATH = "수집관리/backfill_cursor.json"
+
+
+def load_backfill_cursor() -> dict:
+    """백필 페이지 커서를 GCS에서 로드합니다."""
+    try:
+        gcs = storage.Client()
+        bucket = gcs.bucket(BUCKET_NAME)
+        blob = bucket.blob(BACKFILL_CURSOR_PATH)
+        if blob.exists():
+            return json.loads(blob.download_as_text())
+    except Exception:
+        pass
+    return {}
+
+
+def save_backfill_cursor(cursor: dict):
+    """백필 페이지 커서를 GCS에 저장합니다."""
+    cursor["_last_updated"] = datetime.now(KST).isoformat()
+    gcs = storage.Client()
+    bucket = gcs.bucket(BUCKET_NAME)
+    blob = bucket.blob(BACKFILL_CURSOR_PATH)
+    blob.upload_from_string(
+        json.dumps(cursor, ensure_ascii=False, indent=2),
+        content_type="application/json"
+    )
+
+
+def get_cursor_key(category: str, target: str, query: str) -> str:
+    """커서 딕셔너리의 키를 생성합니다."""
+    return f"{category}__{target}__{query}"
+
 
 @app.post("/backfill-all")
 async def backfill_all():
     """
     전체 세목을 자동 순회하며 백필하는 엔드포인트.
     Cloud Scheduler가 35분 간격으로 호출합니다.
+    페이지 커서를 사용하여 이미 훑은 페이지는 건너뜁니다.
     25분 경과 시 안전하게 중단합니다.
     """
     start_time = datetime.now(KST)
-    TIME_LIMIT_SECONDS = 25 * 60  # 25분 (Cloud Run 30분 타임아웃에 5분 여유)
+    TIME_LIMIT_SECONDS = 25 * 60  # 25분
 
     manifest = load_manifest()
+    cursor = load_backfill_cursor()
 
     vertexai.init(project=PROJECT_ID, location=GCP_LOCATION)
     model = GenerativeModel(GEMINI_MODEL)
@@ -1181,6 +1223,8 @@ async def backfill_all():
     total_new = 0
     total_skipped = 0
     total_errors = 0
+    queries_done_count = 0
+    queries_total_count = 0
     category_summary = {}
     time_expired = False
 
@@ -1189,7 +1233,6 @@ async def backfill_all():
             break
 
         cat_new = 0
-        cat_skipped = 0
 
         for target in config["targets"]:
             if time_expired:
@@ -1203,11 +1246,24 @@ async def backfill_all():
                 if time_expired:
                     break
 
-                for page in range(1, BACKFILL_MAX_PAGES_PER_QUERY + 1):
-                    # ── 시간 체크: 25분 초과 시 안전 중단 ──
+                queries_total_count += 1
+                cursor_key = get_cursor_key(category, target, query)
+                cursor_entry = cursor.get(cursor_key, {"page": 1, "done": False})
+
+                # 이 쿼리가 이미 완료(마지막 페이지까지 수집)면 스킵
+                if cursor_entry.get("done", False):
+                    queries_done_count += 1
+                    continue
+
+                start_page = cursor_entry.get("page", 1)
+
+                for page in range(start_page, start_page + 100):
+                    # ── 시간 체크 ──
                     elapsed = (datetime.now(KST) - start_time).total_seconds()
                     if elapsed >= TIME_LIMIT_SECONDS:
                         time_expired = True
+                        # 현재 페이지를 커서에 저장 (다음 호출 시 여기서부터)
+                        cursor[cursor_key] = {"page": page, "done": False}
                         break
 
                     try:
@@ -1220,15 +1276,17 @@ async def backfill_all():
                         )
 
                         if not items:
-                            break  # 이 쿼리는 더 이상 결과 없음 → 다음 쿼리로
-
-                        all_skipped_this_page = True
+                            # 더 이상 결과 없음 → 이 쿼리 완료!
+                            cursor[cursor_key] = {"page": page, "done": True}
+                            queries_done_count += 1
+                            break
 
                         for item in items:
                             # 시간 체크
                             elapsed = (datetime.now(KST) - start_time).total_seconds()
                             if elapsed >= TIME_LIMIT_SECONDS:
                                 time_expired = True
+                                cursor[cursor_key] = {"page": page, "done": False}
                                 break
 
                             record_id = extract_record_id(item, target)
@@ -1236,11 +1294,8 @@ async def backfill_all():
                                 continue
 
                             if is_already_collected(manifest, target, record_id):
-                                cat_skipped += 1
                                 total_skipped += 1
                                 continue
-
-                            all_skipped_this_page = False
 
                             info = extract_case_info(item, target)
                             await asyncio.sleep(API_CALL_DELAY)
@@ -1259,7 +1314,6 @@ async def backfill_all():
                                     cat_new += 1
                                     total_new += 1
                                     mark_collected(manifest, target, record_id)
-                                    # 건마다 즉시 매니페스트 저장
                                     try:
                                         save_manifest(manifest)
                                     except Exception:
@@ -1267,22 +1321,21 @@ async def backfill_all():
                             except Exception:
                                 total_errors += 1
 
-                        # 이 페이지가 전부 스킵(이미 수집)이면 다음 페이지도 같을 가능성 높음
-                        # → 다음 쿼리로 넘어감
-                        if all_skipped_this_page and cat_skipped > 50:
-                            break
+                        # 이 페이지를 처리 완료 → 커서를 다음 페이지로
+                        if not time_expired:
+                            cursor[cursor_key] = {"page": page + 1, "done": False}
 
                     except Exception:
                         total_errors += 1
-                        break  # 이 쿼리 에러 → 다음 쿼리로
+                        # 에러 시 현재 페이지 기록 후 다음 쿼리로
+                        cursor[cursor_key] = {"page": page, "done": False}
+                        break
 
-        category_summary[category] = {
-            "new": cat_new,
-            "skipped": cat_skipped,
-        }
+        category_summary[category] = {"new": cat_new}
 
-    # 최종 매니페스트 저장
+    # 커서 & 매니페스트 저장
     try:
+        save_backfill_cursor(cursor)
         save_manifest(manifest)
     except Exception:
         pass
@@ -1298,11 +1351,26 @@ async def backfill_all():
             "total_new_saved": total_new,
             "total_skipped": total_skipped,
             "total_errors": total_errors,
+            "queries_done": queries_done_count,
+            "queries_total": queries_total_count,
             "manifest_prec_count": len(manifest.get("prec", {})),
-            "manifest_expc_count": len(manifest.get("expc", {})),
         },
         "category_summary": category_summary,
     }
+
+
+# ============================================================
+# [신규] 백필 커서 초기화 (/reset-backfill-cursor)
+# ─────────────────────────────────────────
+# 모든 쿼리를 처음부터 다시 수집하고 싶을 때 사용합니다.
+# 커서만 초기화하며, 이미 수집된 데이터나 매니페스트는 유지됩니다.
+# ============================================================
+
+@app.post("/reset-backfill-cursor")
+async def reset_backfill_cursor():
+    """백필 커서를 초기화합니다. 모든 쿼리가 page 1부터 다시 시작됩니다."""
+    save_backfill_cursor({})
+    return {"status": "reset", "message": "백필 커서가 초기화되었습니다. 다음 backfill-all 호출 시 처음부터 시작합니다."}
 
 
 # ============================================================
